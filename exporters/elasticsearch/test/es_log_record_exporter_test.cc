@@ -297,7 +297,13 @@ protected:
 // so when the caller's deadline runs out rather than when the response timeout does.
 TEST_F(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
 {
-  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &) {});
+  // The handler is kept because a dropped one now reports a failure from its destructor, which
+  // would finish the session and leave nothing for the flush to wait on. The real curl operation
+  // owns the handler until the request ends, so this is also the truer shape.
+  std::vector<std::shared_ptr<http_client::EventHandler>> kept;
+  auto fixture = MakeExporter([&kept](const std::shared_ptr<http_client::EventHandler> &handler) {
+    kept.push_back(handler);
+  });
   ExportOnce(*fixture.exporter);
 
   const auto start   = std::chrono::steady_clock::now();
@@ -340,8 +346,10 @@ TEST_F(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait
 TEST_F(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
 {
   bool respond = true;
+  std::vector<std::shared_ptr<http_client::EventHandler>> kept;
   auto fixture =
-      MakeExporter([&respond](const std::shared_ptr<http_client::EventHandler> &handler) {
+      MakeExporter([&respond, &kept](const std::shared_ptr<http_client::EventHandler> &handler) {
+        kept.push_back(handler);  // the second session has to stay unfinished
         if (respond)
         {
           FakeResponse response(200, kAcceptedBody);
@@ -429,5 +437,119 @@ TEST_F(ElasticsearchForceFlushTests, AFailedExportStillFinishesItsSession)
   });
   ExportOnce(*fixture.exporter);
 
+  EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+}
+// ---------------------------------------------------------------------------
+// Exactly-once accounting for the async handler, which exists only in an async build, so
+// these cases skip there rather than compile out.
+// ---------------------------------------------------------------------------
+
+class ElasticsearchAsyncCompletionTests : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+#ifndef ENABLE_ASYNC_EXPORT
+    GTEST_SKIP() << "the async handler does not exist when async export is disabled";
+#endif
+  }
+};
+// The three states the handler used to drop. Each has to finish the session, or ForceFlush waits
+// on a request that can never complete.
+TEST_F(ElasticsearchAsyncCompletionTests, PreviouslyIgnoredStatesFinishTheSession)
+{
+  for (const auto state :
+       {http_client::SessionState::ReadError, http_client::SessionState::WriteError,
+        http_client::SessionState::Destroyed})
+  {
+    SCOPED_TRACE(static_cast<int>(state));
+    std::vector<std::shared_ptr<http_client::EventHandler>> kept;
+    auto fixture =
+        MakeExporter([&kept, state](const std::shared_ptr<http_client::EventHandler> &handler) {
+          kept.push_back(handler);  // so the event, not the destructor, is what finishes it
+          handler->OnEvent(state, "");
+        });
+    ExportOnce(*fixture.exporter);
+    EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+  }
+}
+
+// What Session::SendRequest does when HttpOperation::SendAsync fails to set up: the operation
+// dispatches ConnectFailed and returns non-OK, then SendRequest dispatches CreateFailed for the
+// same handler. One export, so one finished session, not two.
+TEST_F(ElasticsearchAsyncCompletionTests, TwoTerminalEventsCountAsOneSession)
+{
+  // The real curl operation owns the handler until the request finishes, so a fake that lets it
+  // go would make every request complete the moment SendRequest returns. The test owns them
+  // instead of the fakes, since a handler owns its session and the reverse would be a cycle.
+  std::vector<std::shared_ptr<http_client::EventHandler>> kept;
+  int session = 0;
+  auto fixture =
+      MakeExporter([&kept, &session](const std::shared_ptr<http_client::EventHandler> &handler) {
+        kept.push_back(handler);
+        if (++session == 1)
+        {
+          handler->OnEvent(http_client::SessionState::ConnectFailed, "");
+          handler->OnEvent(http_client::SessionState::CreateFailed, "");
+        }
+      });
+
+  ExportOnce(*fixture.exporter);  // reports twice before the fix
+  ExportOnce(*fixture.exporter);  // never calls back
+
+  EXPECT_FALSE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}))
+      << "the second session is still in flight";
+}
+
+// The other in-tree double fire: the completion lambda uses two independent ifs, so an aborted
+// operation that also has a response reports Cancelled and then delivers the response.
+TEST_F(ElasticsearchAsyncCompletionTests, CancelledThenAResponseCountsOnce)
+{
+  std::vector<std::shared_ptr<http_client::EventHandler>> kept;
+  int session = 0;
+  auto fixture =
+      MakeExporter([&kept, &session](const std::shared_ptr<http_client::EventHandler> &handler) {
+        kept.push_back(handler);
+        if (++session == 1)
+        {
+          handler->OnEvent(http_client::SessionState::Cancelled, "");
+          FakeResponse response(200, kAcceptedBody);
+          handler->OnResponse(response);
+        }
+      });
+
+  ExportOnce(*fixture.exporter);
+  ExportOnce(*fixture.exporter);
+
+  EXPECT_FALSE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+}
+
+// A response followed by the session being torn down is the ordinary successful shape.
+TEST_F(ElasticsearchAsyncCompletionTests, ResponseThenDestroyedCountsOnce)
+{
+  std::vector<std::shared_ptr<http_client::EventHandler>> kept;
+  int session = 0;
+  auto fixture =
+      MakeExporter([&kept, &session](const std::shared_ptr<http_client::EventHandler> &handler) {
+        kept.push_back(handler);
+        if (++session == 1)
+        {
+          FakeResponse response(200, kAcceptedBody);
+          handler->OnResponse(response);
+          handler->OnEvent(http_client::SessionState::Destroyed, "");
+        }
+      });
+
+  ExportOnce(*fixture.exporter);
+  ExportOnce(*fixture.exporter);
+
+  EXPECT_FALSE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+}
+
+// A handler destroyed without ever reporting still has to finish its session.
+TEST_F(ElasticsearchAsyncCompletionTests, AHandlerDestroyedWithoutAnOutcomeStillFinishes)
+{
+  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &) {});
+  ExportOnce(*fixture.exporter);
   EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
 }
