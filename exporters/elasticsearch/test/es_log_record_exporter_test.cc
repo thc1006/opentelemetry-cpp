@@ -4,7 +4,9 @@
 #include "opentelemetry/exporters/elasticsearch/es_log_record_exporter.h"
 #include "opentelemetry/common/timestamp.h"
 #include "opentelemetry/exporters/elasticsearch/es_log_recordable.h"
+#include "opentelemetry/ext/http/client/http_client.h"
 #include "opentelemetry/logs/severity.h"
+#include "opentelemetry/nostd/function_ref.h"
 #include "opentelemetry/nostd/span.h"
 #include "opentelemetry/nostd/string_view.h"
 #include "opentelemetry/nostd/utility.h"
@@ -19,7 +21,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <thread>
 #include <utility>
 #include "nlohmann/json.hpp"
 
@@ -142,3 +146,224 @@ TEST(ElasticsearchLogRecordableTests, BasicTests)
 
   EXPECT_EQ(actual, expected);
 }
+namespace
+{
+namespace http_client = opentelemetry::ext::http::client;
+
+// Accepted by both the substring check and a top level "errors": false parse, so
+// these cases keep meaning the same thing whichever success check is in place.
+constexpr const char *kAcceptedBody =
+    R"({"took":30,"errors":false,"items":[{"index":{"_shards":{"failed" : 0}}}]})";
+
+class FakeResponse : public http_client::Response
+{
+public:
+  FakeResponse(http_client::StatusCode status, const std::string &body)
+      : status_(status), body_(body.begin(), body.end())
+  {}
+  const http_client::Body &GetBody() const noexcept override { return body_; }
+  bool ForEachHeader(
+      nostd::function_ref<bool(nostd::string_view, nostd::string_view)>) const noexcept override
+  {
+    return true;
+  }
+  bool ForEachHeader(
+      const nostd::string_view &,
+      nostd::function_ref<bool(nostd::string_view, nostd::string_view)>) const noexcept override
+  {
+    return true;
+  }
+  http_client::StatusCode GetStatusCode() const noexcept override { return status_; }
+
+private:
+  http_client::StatusCode status_;
+  http_client::Body body_;
+};
+
+class FakeRequest : public http_client::Request
+{
+public:
+  void SetMethod(http_client::Method) noexcept override {}
+  void SetUri(nostd::string_view) noexcept override {}
+  void SetSslOptions(const http_client::HttpSslOptions &) noexcept override {}
+  void SetBody(http_client::Body &) noexcept override {}
+  void AddHeader(nostd::string_view, nostd::string_view) noexcept override {}
+  void ReplaceHeader(nostd::string_view, nostd::string_view) noexcept override {}
+  void SetTimeoutMs(std::chrono::milliseconds) noexcept override {}
+  void SetCompression(const http_client::Compression &) noexcept override {}
+  void EnableLogging(bool) noexcept override {}
+  void SetRetryPolicy(const http_client::RetryPolicy &) noexcept override {}
+};
+
+using EventScript = std::function<void(http_client::EventHandler &)>;
+
+class FakeSession : public http_client::Session
+{
+public:
+  explicit FakeSession(EventScript script) : script_(std::move(script)) {}
+  std::shared_ptr<http_client::Request> CreateRequest() noexcept override
+  {
+    return std::make_shared<FakeRequest>();
+  }
+  void SendRequest(std::shared_ptr<http_client::EventHandler> handler) noexcept override
+  {
+    last_handler_ = handler;
+    script_(*handler);
+  }
+
+  // Kept so a test can deliver a completion after the flush has started waiting.
+  std::shared_ptr<http_client::EventHandler> last_handler_;
+  bool IsSessionActive() noexcept override { return false; }
+  bool CancelSession() noexcept override { return true; }
+  bool FinishSession() noexcept override { return true; }
+
+private:
+  EventScript script_;
+};
+
+class FakeHttpClient : public http_client::HttpClient
+{
+public:
+  explicit FakeHttpClient(EventScript script) : script_(std::move(script)) {}
+  std::shared_ptr<http_client::Session> CreateSession(nostd::string_view) noexcept override
+  {
+    last_session_ = std::make_shared<FakeSession>(script_);
+    return last_session_;
+  }
+
+  std::shared_ptr<FakeSession> last_session_;
+  bool CancelAllSessions() noexcept override { return true; }
+  bool FinishAllSessions() noexcept override { return true; }
+  void SetMaxSessionsPerConnection(std::size_t) noexcept override {}
+
+private:
+  EventScript script_;
+};
+
+opentelemetry::sdk::common::ExportResult ExportWith(EventScript script)
+{
+  auto client = std::make_shared<FakeHttpClient>(std::move(script));
+  logs_exporter::ElasticsearchExporterOptions options;
+  logs_exporter::ElasticsearchLogRecordExporter exporter(options, client);
+  auto record = exporter.MakeRecordable();
+  return exporter.Export(nostd::span<std::unique_ptr<sdklogs::Recordable>>(&record, 1));
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// ForceFlush deadline. Only built with async export, which is the only
+// configuration where the wait exists.
+// ---------------------------------------------------------------------------
+#ifdef ENABLE_ASYNC_EXPORT
+namespace
+{
+// A response timeout short enough that a wait bounded by it instead of by the caller's deadline
+// is visible in the elapsed time.
+constexpr int kShortResponseTimeoutSeconds = 2;
+
+struct FlushFixture
+{
+  std::shared_ptr<FakeHttpClient> client;
+  std::unique_ptr<logs_exporter::ElasticsearchLogRecordExporter> exporter;
+};
+
+FlushFixture MakeExporter(EventScript script)
+{
+  FlushFixture fixture;
+  fixture.client = std::make_shared<FakeHttpClient>(std::move(script));
+  logs_exporter::ElasticsearchExporterOptions options;
+  options.response_timeout_ = kShortResponseTimeoutSeconds;
+  fixture.exporter          = std::unique_ptr<logs_exporter::ElasticsearchLogRecordExporter>(
+      new logs_exporter::ElasticsearchLogRecordExporter(options, fixture.client));
+  return fixture;
+}
+
+void ExportOnce(logs_exporter::ElasticsearchLogRecordExporter &exporter)
+{
+  auto record = exporter.MakeRecordable();
+  exporter.Export(nostd::span<std::unique_ptr<sdklogs::Recordable>>(&record, 1));
+}
+}  // namespace
+
+// The session never calls back, so the flush cannot complete. It has to say so, and it has to say
+// so when the caller's deadline runs out rather than when the response timeout does.
+TEST(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
+{
+  auto fixture = MakeExporter([](http_client::EventHandler &) {});
+  ExportOnce(*fixture.exporter);
+
+  const auto start   = std::chrono::steady_clock::now();
+  const bool flushed = fixture.exporter->ForceFlush(std::chrono::milliseconds{20});
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_FALSE(flushed);
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+            kShortResponseTimeoutSeconds * 1000);
+}
+
+// Nothing outstanding, so there is nothing to wait for.
+TEST(ElasticsearchForceFlushTests, ReturnsImmediatelyWithNothingInFlight)
+{
+  auto fixture = MakeExporter([](http_client::EventHandler &) {});
+
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                  start)
+                .count(),
+            kShortResponseTimeoutSeconds * 1000);
+}
+
+// The session completes inside SendRequest(), before the flush is even asked for, so the
+// completion is already published when the predicate is first evaluated.
+TEST(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait)
+{
+  auto fixture = MakeExporter([](http_client::EventHandler &handler) {
+    FakeResponse response(200, kAcceptedBody);
+    handler.OnResponse(response);
+  });
+  ExportOnce(*fixture.exporter);
+
+  EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+}
+
+// Two exports, one of which never finishes. Reporting success here would tell the caller data was
+// flushed that is still in flight.
+TEST(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
+{
+  bool respond = true;
+  auto fixture = MakeExporter([&respond](http_client::EventHandler &handler) {
+    if (respond)
+    {
+      FakeResponse response(200, kAcceptedBody);
+      handler.OnResponse(response);
+    }
+  });
+  ExportOnce(*fixture.exporter);
+  respond = false;
+  ExportOnce(*fixture.exporter);
+
+  EXPECT_FALSE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+}
+
+// A completion delivered from another thread after the waiter has parked has to wake it. This is
+// the half the inline scripts above cannot reach.
+TEST(ElasticsearchForceFlushTests, ACompletionAfterTheWaiterParksWakesIt)
+{
+  auto fixture = MakeExporter([](http_client::EventHandler &) {});
+  ExportOnce(*fixture.exporter);
+  ASSERT_NE(fixture.client->last_session_, nullptr);
+  const auto captured = fixture.client->last_session_->last_handler_;
+  ASSERT_NE(captured, nullptr);
+
+  std::thread responder([&captured] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    FakeResponse response(200, kAcceptedBody);
+    captured->OnResponse(response);
+  });
+
+  const bool flushed = fixture.exporter->ForceFlush(std::chrono::seconds{5});
+  responder.join();
+  EXPECT_TRUE(flushed);
+}
+#endif  // ENABLE_ASYNC_EXPORT

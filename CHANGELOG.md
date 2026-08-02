@@ -15,6 +15,9 @@ Increment the:
 
 ## [Unreleased]
 
+* [BUG] Hold the Elasticsearch ForceFlush to the caller's timeout
+  [#4337](https://github.com/open-telemetry/opentelemetry-cpp/pull/4337)
+
 * [BUILD] Run the ext_http component install test on Windows
   [#4326](https://github.com/open-telemetry/opentelemetry-cpp/pull/4326)
 

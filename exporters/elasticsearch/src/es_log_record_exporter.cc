@@ -451,7 +451,12 @@ sdk::common::ExportResult ElasticsearchLogRecordExporter::Export(
                                                                            << " trace span(s) success");
         }
 
-        synchronization_data->finished_session_counter_.fetch_add(1, std::memory_order_release);
+        {
+          // Published under the mutex ForceFlush() waits on. A waiter that has evaluated its
+          // predicate but not yet parked would otherwise not see this until the next wakeup.
+          std::lock_guard<std::mutex> lock(synchronization_data->force_flush_cv_m);
+          synchronization_data->finished_session_counter_.fetch_add(1, std::memory_order_release);
+        }
         synchronization_data->force_flush_cv.notify_all();
         return true;
       },
@@ -500,41 +505,41 @@ bool ElasticsearchLogRecordExporter::ForceFlush(std::chrono::microseconds timeou
                                                 OPENTELEMETRY_MAYBE_UNUSED) noexcept
 {
 #ifdef ENABLE_ASYNC_EXPORT
+  // Serialises concurrent ForceFlush() calls.
   std::lock_guard<std::recursive_mutex> lock_guard{synchronization_data_->force_flush_m};
-  std::size_t running_counter =
+
+  // The flush covers the sessions that were already running when it was asked for.
+  const std::size_t running_counter =
       synchronization_data_->session_counter_.load(std::memory_order_acquire);
+  const auto flushed = [this, running_counter]() {
+    return synchronization_data_->finished_session_counter_.load(std::memory_order_acquire) >=
+           running_counter;
+  };
+
   // ASAN will report chrono: runtime error: signed integer overflow: A + B cannot be represented
-  //   in type 'long int' here. So we reset timeout to meet signed long int limit here.
+  //   in type 'long int' here. So we reset timeout to meet signed long int limit here. Zero is
+  //   what that returns for a timeout there is no point waiting against, which is also how a
+  //   caller asks for no deadline.
   timeout = opentelemetry::common::DurationUtil::AdjustWaitForTimeout(
       timeout, std::chrono::microseconds::zero());
 
-  std::chrono::steady_clock::duration timeout_steady =
+  std::unique_lock<std::mutex> lock(synchronization_data_->force_flush_cv_m);
+
+  if (timeout <= std::chrono::microseconds::zero())
+  {
+    // wait() only returns once the predicate holds, so the flush has completed.
+    synchronization_data_->force_flush_cv.wait(lock, flushed);
+    return true;
+  }
+
+  // One deadline for the call, so a wakeup that is not a completion resumes against what is left
+  // rather than starting the wait again. wait_until() returns the predicate, so a flush that ran
+  // out of time cannot report success.
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
-  if (timeout_steady <= std::chrono::steady_clock::duration::zero())
-  {
-    timeout_steady = (std::chrono::steady_clock::duration::max)();
-  }
 
-  std::unique_lock<std::mutex> lk_cv(synchronization_data_->force_flush_cv_m);
-  // Wait for all the sessions to finish
-  while (timeout_steady > std::chrono::steady_clock::duration::zero())
-  {
-    if (synchronization_data_->finished_session_counter_.load(std::memory_order_acquire) >=
-        running_counter)
-    {
-      break;
-    }
-
-    std::chrono::steady_clock::time_point start_timepoint = std::chrono::steady_clock::now();
-    if (std::cv_status::no_timeout != synchronization_data_->force_flush_cv.wait_for(
-                                          lk_cv, std::chrono::seconds{options_.response_timeout_}))
-    {
-      break;
-    }
-    timeout_steady -= std::chrono::steady_clock::now() - start_timepoint;
-  }
-
-  return timeout_steady > std::chrono::steady_clock::duration::zero();
+  return synchronization_data_->force_flush_cv.wait_until(lock, deadline, flushed);
 #else
   return true;
 #endif
