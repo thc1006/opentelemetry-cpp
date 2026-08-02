@@ -4,7 +4,9 @@
 #include "opentelemetry/exporters/elasticsearch/es_log_record_exporter.h"
 #include "opentelemetry/common/timestamp.h"
 #include "opentelemetry/exporters/elasticsearch/es_log_recordable.h"
+#include "opentelemetry/ext/http/client/http_client.h"
 #include "opentelemetry/logs/severity.h"
+#include "opentelemetry/nostd/function_ref.h"
 #include "opentelemetry/nostd/span.h"
 #include "opentelemetry/nostd/string_view.h"
 #include "opentelemetry/nostd/utility.h"
@@ -19,17 +21,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 #include "nlohmann/json.hpp"
-
-#ifdef ENABLE_ASYNC_EXPORT
-#  include <functional>
-#  include <thread>
-#  include <vector>
-#  include "opentelemetry/ext/http/client/http_client.h"
-#  include "opentelemetry/nostd/function_ref.h"
-#endif
 
 namespace sdklogs       = opentelemetry::sdk::logs;
 namespace logs_api      = opentelemetry::logs;
@@ -150,9 +147,10 @@ TEST(ElasticsearchLogRecordableTests, BasicTests)
 
   EXPECT_EQ(actual, expected);
 }
-// async build, so it is inside the same guard to avoid unused entities elsewhere.
-// The fixture below is only used by the ForceFlush cases, which exist only in an
-#ifdef ENABLE_ASYNC_EXPORT
+
+// ---------------------------------------------------------------------------
+// ForceFlush deadline.
+// ---------------------------------------------------------------------------
 namespace
 {
 namespace http_client = opentelemetry::ext::http::client;
@@ -276,9 +274,25 @@ void ExportOnce(logs_exporter::ElasticsearchLogRecordExporter &exporter)
 }
 }  // namespace
 
+// The wait these cases describe exists only in an async build, so they skip elsewhere rather than
+// compile out: gtest_add_tests reads the source, and a case missing from the binary is still
+// registered with CTest, where it then reports a pass without having run. The skip goes in SetUp
+// because GTEST_SKIP returns, and a skip at the top of each body would leave the rest of that body
+// unreachable, which MSVC reports as C4702.
+class ElasticsearchForceFlushTests : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+#ifndef ENABLE_ASYNC_EXPORT
+    GTEST_SKIP() << "ForceFlush has nothing to wait for when async export is disabled";
+#endif
+  }
+};
+
 // The session never calls back, so the flush cannot complete. It has to say so, and it has to say
 // so when the caller's deadline runs out rather than when the response timeout does.
-TEST(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
+TEST_F(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
 {
   auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &) {});
   ExportOnce(*fixture.exporter);
@@ -293,7 +307,7 @@ TEST(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
 }
 
 // Nothing outstanding, so there is nothing to wait for.
-TEST(ElasticsearchForceFlushTests, ReturnsImmediatelyWithNothingInFlight)
+TEST_F(ElasticsearchForceFlushTests, ReturnsImmediatelyWithNothingInFlight)
 {
   auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &) {});
 
@@ -307,7 +321,7 @@ TEST(ElasticsearchForceFlushTests, ReturnsImmediatelyWithNothingInFlight)
 
 // The session completes inside SendRequest(), before the flush is even asked for, so the
 // completion is already published when the predicate is first evaluated.
-TEST(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait)
+TEST_F(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait)
 {
   auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &handler) {
     FakeResponse response(200, kAcceptedBody);
@@ -320,7 +334,7 @@ TEST(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait)
 
 // Two exports, one of which never finishes. Reporting success here would tell the caller data was
 // flushed that is still in flight.
-TEST(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
+TEST_F(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
 {
   bool respond = true;
   auto fixture =
@@ -340,7 +354,7 @@ TEST(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
 
 // A completion delivered from another thread after the waiter has parked has to wake it. This is
 // the half the inline scripts above cannot reach.
-TEST(ElasticsearchForceFlushTests, ACompletionAfterTheWaiterParksWakesIt)
+TEST_F(ElasticsearchForceFlushTests, ACompletionAfterTheWaiterParksWakesIt)
 {
   // Held by the test, not by the fakes: a handler owns its session, so a session that also owned
   // its handler would be a reference cycle and leak.
@@ -365,7 +379,7 @@ TEST(ElasticsearchForceFlushTests, ACompletionAfterTheWaiterParksWakesIt)
 
 // A second caller gets its own deadline. Serialising the calls is fine, making the second one
 // wait out the first one's is not, since its timeout would mean nothing.
-TEST(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
+TEST_F(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
 {
   std::vector<std::shared_ptr<http_client::EventHandler>> kept;
   auto fixture = MakeExporter([&kept](const std::shared_ptr<http_client::EventHandler> &handler) {
@@ -391,7 +405,7 @@ TEST(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
 // The default argument is microseconds::max(), which AdjustWaitForTimeout maps to the sentinel for
 // no deadline. That branch takes the lock outright and waits on the predicate, so it needs a case
 // where the predicate already holds or the test would never return.
-TEST(ElasticsearchForceFlushTests, AnIndefiniteFlushReturnsOnceEverythingIsFinished)
+TEST_F(ElasticsearchForceFlushTests, AnIndefiniteFlushReturnsOnceEverythingIsFinished)
 {
   auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &handler) {
     FakeResponse response(200, kAcceptedBody);
@@ -404,7 +418,7 @@ TEST(ElasticsearchForceFlushTests, AnIndefiniteFlushReturnsOnceEverythingIsFinis
 
 // A failed export still finishes its session, so the flush completes and reports success even
 // though the export itself did not.
-TEST(ElasticsearchForceFlushTests, AFailedExportStillFinishesItsSession)
+TEST_F(ElasticsearchForceFlushTests, AFailedExportStillFinishesItsSession)
 {
   auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &handler) {
     FakeResponse response(200, R"({"took":1,"errors":true,"items":[]})");
@@ -414,4 +428,3 @@ TEST(ElasticsearchForceFlushTests, AFailedExportStillFinishesItsSession)
 
   EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
 }
-#endif  // ENABLE_ASYNC_EXPORT
