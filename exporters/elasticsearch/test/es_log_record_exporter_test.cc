@@ -147,6 +147,9 @@ TEST(ElasticsearchLogRecordableTests, BasicTests)
 
   EXPECT_EQ(actual, expected);
 }
+// async build, so it is inside the same guard to avoid unused entities elsewhere.
+// The fixture below is only used by the ForceFlush cases, which exist only in an
+#ifdef ENABLE_ASYNC_EXPORT
 namespace
 {
 namespace http_client = opentelemetry::ext::http::client;
@@ -234,21 +237,12 @@ private:
   EventScript script_;
 };
 
-opentelemetry::sdk::common::ExportResult ExportWith(EventScript script)
-{
-  auto client = std::make_shared<FakeHttpClient>(std::move(script));
-  logs_exporter::ElasticsearchExporterOptions options;
-  logs_exporter::ElasticsearchLogRecordExporter exporter(options, client);
-  auto record = exporter.MakeRecordable();
-  return exporter.Export(nostd::span<std::unique_ptr<sdklogs::Recordable>>(&record, 1));
-}
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // ForceFlush deadline. Only built with async export, which is the only
 // configuration where the wait exists.
 // ---------------------------------------------------------------------------
-#ifdef ENABLE_ASYNC_EXPORT
 namespace
 {
 // A response timeout short enough that a wait bounded by it instead of by the caller's deadline
