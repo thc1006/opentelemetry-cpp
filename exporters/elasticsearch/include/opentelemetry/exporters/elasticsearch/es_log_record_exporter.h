@@ -153,9 +153,6 @@ private:
     std::atomic<std::size_t> finished_session_counter_{0};
     std::condition_variable force_flush_cv;
     std::mutex force_flush_cv_m;
-    // Timed so that a second ForceFlush() caller is bounded by its own deadline rather than
-    // by however long the first one waits.
-    std::recursive_timed_mutex force_flush_m;
   };
   nostd::shared_ptr<SynchronizationData> synchronization_data_;
 #endif
