@@ -505,8 +505,35 @@ bool ElasticsearchLogRecordExporter::ForceFlush(std::chrono::microseconds timeou
                                                 OPENTELEMETRY_MAYBE_UNUSED) noexcept
 {
 #ifdef ENABLE_ASYNC_EXPORT
+  // ASAN will report chrono: runtime error: signed integer overflow: A + B cannot be represented
+  //   in type 'long int' here. So we reset timeout to meet signed long int limit here. Zero is
+  //   what that returns for a timeout there is no point waiting against, which is also how a
+  //   caller asks for no deadline.
+  timeout = opentelemetry::common::DurationUtil::AdjustWaitForTimeout(
+      timeout, std::chrono::microseconds::zero());
+
+  // One deadline for the whole call, taken before anything can block, so that time spent waiting
+  // for another ForceFlush() to finish counts against the caller's budget too.
+  const bool indefinite = timeout <= std::chrono::microseconds::zero();
+  const std::chrono::steady_clock::time_point deadline =
+      indefinite ? (std::chrono::steady_clock::time_point::max)()
+                 : std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+
   // Serialises concurrent ForceFlush() calls.
-  std::lock_guard<std::recursive_mutex> lock_guard{synchronization_data_->force_flush_m};
+  std::unique_lock<std::recursive_timed_mutex> flush_guard{synchronization_data_->force_flush_m,
+                                                           std::defer_lock};
+  if (indefinite)
+  {
+    flush_guard.lock();
+  }
+  else if (!flush_guard.try_lock_until(deadline))
+  {
+    // Ran out of time before this call could even start. Everything outstanding may still have
+    // finished while waiting, so answer from the counters rather than assuming failure.
+    return synchronization_data_->finished_session_counter_.load(std::memory_order_acquire) >=
+           synchronization_data_->session_counter_.load(std::memory_order_acquire);
+  }
 
   // The flush covers the sessions that were already running when it was asked for.
   const std::size_t running_counter =
@@ -516,29 +543,16 @@ bool ElasticsearchLogRecordExporter::ForceFlush(std::chrono::microseconds timeou
            running_counter;
   };
 
-  // ASAN will report chrono: runtime error: signed integer overflow: A + B cannot be represented
-  //   in type 'long int' here. So we reset timeout to meet signed long int limit here. Zero is
-  //   what that returns for a timeout there is no point waiting against, which is also how a
-  //   caller asks for no deadline.
-  timeout = opentelemetry::common::DurationUtil::AdjustWaitForTimeout(
-      timeout, std::chrono::microseconds::zero());
-
   std::unique_lock<std::mutex> lock(synchronization_data_->force_flush_cv_m);
 
-  if (timeout <= std::chrono::microseconds::zero())
+  if (indefinite)
   {
     // wait() only returns once the predicate holds, so the flush has completed.
     synchronization_data_->force_flush_cv.wait(lock, flushed);
     return true;
   }
 
-  // One deadline for the call, so a wakeup that is not a completion resumes against what is left
-  // rather than starting the wait again. wait_until() returns the predicate, so a flush that ran
-  // out of time cannot report success.
-  const std::chrono::steady_clock::time_point deadline =
-      std::chrono::steady_clock::now() +
-      std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
-
+  // wait_until() returns the predicate, so a flush that ran out of time cannot report success.
   return synchronization_data_->force_flush_cv.wait_until(lock, deadline, flushed);
 #else
   return true;

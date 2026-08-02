@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 #include "nlohmann/json.hpp"
 
 namespace sdklogs       = opentelemetry::sdk::logs;
@@ -195,7 +196,7 @@ public:
   void SetRetryPolicy(const http_client::RetryPolicy &) noexcept override {}
 };
 
-using EventScript = std::function<void(http_client::EventHandler &)>;
+using EventScript = std::function<void(const std::shared_ptr<http_client::EventHandler> &)>;
 
 class FakeSession : public http_client::Session
 {
@@ -207,12 +208,8 @@ public:
   }
   void SendRequest(std::shared_ptr<http_client::EventHandler> handler) noexcept override
   {
-    last_handler_ = handler;
-    script_(*handler);
+    script_(handler);
   }
-
-  // Kept so a test can deliver a completion after the flush has started waiting.
-  std::shared_ptr<http_client::EventHandler> last_handler_;
   bool IsSessionActive() noexcept override { return false; }
   bool CancelSession() noexcept override { return true; }
   bool FinishSession() noexcept override { return true; }
@@ -227,11 +224,8 @@ public:
   explicit FakeHttpClient(EventScript script) : script_(std::move(script)) {}
   std::shared_ptr<http_client::Session> CreateSession(nostd::string_view) noexcept override
   {
-    last_session_ = std::make_shared<FakeSession>(script_);
-    return last_session_;
+    return std::make_shared<FakeSession>(script_);
   }
-
-  std::shared_ptr<FakeSession> last_session_;
   bool CancelAllSessions() noexcept override { return true; }
   bool FinishAllSessions() noexcept override { return true; }
   void SetMaxSessionsPerConnection(std::size_t) noexcept override {}
@@ -289,7 +283,7 @@ void ExportOnce(logs_exporter::ElasticsearchLogRecordExporter &exporter)
 // so when the caller's deadline runs out rather than when the response timeout does.
 TEST(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
 {
-  auto fixture = MakeExporter([](http_client::EventHandler &) {});
+  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &) {});
   ExportOnce(*fixture.exporter);
 
   const auto start   = std::chrono::steady_clock::now();
@@ -304,7 +298,7 @@ TEST(ElasticsearchForceFlushTests, ReportsFailureWhenTheFlushDoesNotComplete)
 // Nothing outstanding, so there is nothing to wait for.
 TEST(ElasticsearchForceFlushTests, ReturnsImmediatelyWithNothingInFlight)
 {
-  auto fixture = MakeExporter([](http_client::EventHandler &) {});
+  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &) {});
 
   const auto start = std::chrono::steady_clock::now();
   EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
@@ -318,9 +312,9 @@ TEST(ElasticsearchForceFlushTests, ReturnsImmediatelyWithNothingInFlight)
 // completion is already published when the predicate is first evaluated.
 TEST(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait)
 {
-  auto fixture = MakeExporter([](http_client::EventHandler &handler) {
+  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &handler) {
     FakeResponse response(200, kAcceptedBody);
-    handler.OnResponse(response);
+    handler->OnResponse(response);
   });
   ExportOnce(*fixture.exporter);
 
@@ -332,13 +326,14 @@ TEST(ElasticsearchForceFlushTests, SucceedsWhenTheSessionFinishedBeforeTheWait)
 TEST(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
 {
   bool respond = true;
-  auto fixture = MakeExporter([&respond](http_client::EventHandler &handler) {
-    if (respond)
-    {
-      FakeResponse response(200, kAcceptedBody);
-      handler.OnResponse(response);
-    }
-  });
+  auto fixture =
+      MakeExporter([&respond](const std::shared_ptr<http_client::EventHandler> &handler) {
+        if (respond)
+        {
+          FakeResponse response(200, kAcceptedBody);
+          handler->OnResponse(response);
+        }
+      });
   ExportOnce(*fixture.exporter);
   respond = false;
   ExportOnce(*fixture.exporter);
@@ -350,10 +345,14 @@ TEST(ElasticsearchForceFlushTests, PartialCompletionIsNotSuccess)
 // the half the inline scripts above cannot reach.
 TEST(ElasticsearchForceFlushTests, ACompletionAfterTheWaiterParksWakesIt)
 {
-  auto fixture = MakeExporter([](http_client::EventHandler &) {});
+  // Held by the test, not by the fakes: a handler owns its session, so a session that also owned
+  // its handler would be a reference cycle and leak.
+  std::shared_ptr<http_client::EventHandler> captured;
+  auto fixture =
+      MakeExporter([&captured](const std::shared_ptr<http_client::EventHandler> &handler) {
+        captured = handler;
+      });
   ExportOnce(*fixture.exporter);
-  ASSERT_NE(fixture.client->last_session_, nullptr);
-  const auto captured = fixture.client->last_session_->last_handler_;
   ASSERT_NE(captured, nullptr);
 
   std::thread responder([&captured] {
@@ -365,5 +364,28 @@ TEST(ElasticsearchForceFlushTests, ACompletionAfterTheWaiterParksWakesIt)
   const bool flushed = fixture.exporter->ForceFlush(std::chrono::seconds{5});
   responder.join();
   EXPECT_TRUE(flushed);
+}
+
+// A second caller gets its own deadline. Serialising the calls is fine, making the second one
+// wait out the first one's is not, since its timeout would mean nothing.
+TEST(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
+{
+  std::vector<std::shared_ptr<http_client::EventHandler>> kept;
+  auto fixture = MakeExporter([&kept](const std::shared_ptr<http_client::EventHandler> &handler) {
+    kept.push_back(handler);
+  });
+  ExportOnce(*fixture.exporter);
+
+  std::thread slow([&fixture] { fixture.exporter->ForceFlush(std::chrono::seconds{3}); });
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start)
+                      .count();
+  slow.join();
+
+  EXPECT_LT(ms, 1000) << "waited behind the first caller instead of its own deadline";
 }
 #endif  // ENABLE_ASYNC_EXPORT
