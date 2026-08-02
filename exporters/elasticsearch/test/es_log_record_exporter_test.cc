@@ -376,7 +376,9 @@ TEST(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
   });
   ExportOnce(*fixture.exporter);
 
-  std::thread slow([&fixture] { fixture.exporter->ForceFlush(std::chrono::seconds{3}); });
+  // The first caller waits well past the bound asserted below, so a second caller that queued
+  // behind it could not come in under that bound by accident.
+  std::thread slow([&fixture] { fixture.exporter->ForceFlush(std::chrono::milliseconds{1500}); });
   std::this_thread::sleep_for(std::chrono::milliseconds{100});
 
   const auto start = std::chrono::steady_clock::now();
@@ -386,7 +388,7 @@ TEST(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
                       .count();
   slow.join();
 
-  EXPECT_LT(ms, 1000) << "waited behind the first caller instead of its own deadline";
+  EXPECT_LT(ms, 700) << "waited behind the first caller instead of its own deadline";
 }
 
 // The default argument is microseconds::max(), which AdjustWaitForTimeout maps to the sentinel for
