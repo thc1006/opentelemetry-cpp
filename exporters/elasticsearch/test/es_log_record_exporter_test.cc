@@ -388,4 +388,31 @@ TEST(ElasticsearchForceFlushTests, AConcurrentFlushKeepsItsOwnDeadline)
 
   EXPECT_LT(ms, 1000) << "waited behind the first caller instead of its own deadline";
 }
+
+// The default argument is microseconds::max(), which AdjustWaitForTimeout maps to the sentinel for
+// no deadline. That branch takes the lock outright and waits on the predicate, so it needs a case
+// where the predicate already holds or the test would never return.
+TEST(ElasticsearchForceFlushTests, AnIndefiniteFlushReturnsOnceEverythingIsFinished)
+{
+  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &handler) {
+    FakeResponse response(200, kAcceptedBody);
+    handler->OnResponse(response);
+  });
+  ExportOnce(*fixture.exporter);
+
+  EXPECT_TRUE(fixture.exporter->ForceFlush());
+}
+
+// A failed export still finishes its session, so the flush completes and reports success even
+// though the export itself did not.
+TEST(ElasticsearchForceFlushTests, AFailedExportStillFinishesItsSession)
+{
+  auto fixture = MakeExporter([](const std::shared_ptr<http_client::EventHandler> &handler) {
+    FakeResponse response(200, R"({"took":1,"errors":true,"items":[]})");
+    handler->OnResponse(response);
+  });
+  ExportOnce(*fixture.exporter);
+
+  EXPECT_TRUE(fixture.exporter->ForceFlush(std::chrono::milliseconds{20}));
+}
 #endif  // ENABLE_ASYNC_EXPORT
