@@ -4,9 +4,7 @@
 #include "opentelemetry/exporters/elasticsearch/es_log_record_exporter.h"
 #include "opentelemetry/common/timestamp.h"
 #include "opentelemetry/exporters/elasticsearch/es_log_recordable.h"
-#include "opentelemetry/ext/http/client/http_client.h"
 #include "opentelemetry/logs/severity.h"
-#include "opentelemetry/nostd/function_ref.h"
 #include "opentelemetry/nostd/span.h"
 #include "opentelemetry/nostd/string_view.h"
 #include "opentelemetry/nostd/utility.h"
@@ -21,12 +19,17 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string>
-#include <thread>
 #include <utility>
-#include <vector>
 #include "nlohmann/json.hpp"
+
+#ifdef ENABLE_ASYNC_EXPORT
+#  include <functional>
+#  include <thread>
+#  include <vector>
+#  include "opentelemetry/ext/http/client/http_client.h"
+#  include "opentelemetry/nostd/function_ref.h"
+#endif
 
 namespace sdklogs       = opentelemetry::sdk::logs;
 namespace logs_api      = opentelemetry::logs;
