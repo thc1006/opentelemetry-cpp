@@ -15,9 +15,12 @@ Increment the:
 
 ## [Unreleased]
 
+* [OTLP/HTTP] Honor `Retry-After` response header when retrying exports,
+  supporting both delay-seconds and HTTP-date formats per RFC 7231 §7.1.3.
+  [#4172](https://github.com/open-telemetry/opentelemetry-cpp/issues/4172)
+
 * [BUG] Hold the Elasticsearch ForceFlush to the caller's timeout
   [#4337](https://github.com/open-telemetry/opentelemetry-cpp/pull/4337)
-
 * [BUILD] Run the ext_http component install test on Windows
   [#4326](https://github.com/open-telemetry/opentelemetry-cpp/pull/4326)
 
