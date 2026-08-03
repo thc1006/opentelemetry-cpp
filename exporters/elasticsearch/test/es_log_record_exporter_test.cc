@@ -445,6 +445,8 @@ TEST_F(ElasticsearchForceFlushTests, AFailedExportStillFinishesItsSession)
 // these cases skip there rather than compile out.
 // ---------------------------------------------------------------------------
 
+namespace
+{
 class ElasticsearchAsyncCompletionTests : public ::testing::Test
 {
 protected:
@@ -455,6 +457,7 @@ protected:
 #endif
   }
 };
+}  // namespace
 // The three states the handler used to drop. Each has to finish the session, or ForceFlush waits
 // on a request that can never complete.
 TEST_F(ElasticsearchAsyncCompletionTests, PreviouslyIgnoredStatesFinishTheSession)
