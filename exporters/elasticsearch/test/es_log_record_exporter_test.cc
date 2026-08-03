@@ -279,6 +279,8 @@ void ExportOnce(logs_exporter::ElasticsearchLogRecordExporter &exporter)
 // registered with CTest, where it then reports a pass without having run. The skip goes in SetUp
 // because GTEST_SKIP returns, and a skip at the top of each body would leave the rest of that body
 // unreachable, which MSVC reports as C4702.
+namespace
+{
 class ElasticsearchForceFlushTests : public ::testing::Test
 {
 protected:
@@ -289,6 +291,7 @@ protected:
 #endif
   }
 };
+}  // namespace
 
 // The session never calls back, so the flush cannot complete. It has to say so, and it has to say
 // so when the caller's deadline runs out rather than when the response timeout does.
